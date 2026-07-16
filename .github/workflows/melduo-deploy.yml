@@ -1,0 +1,51 @@
+name: Melduo Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - melduo/deploy-20260716-220225
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: CDK Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install app dependencies
+        run: npm ci
+
+      - name: Build app
+        run: npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::847460071934:role/MelduoOidc-cmrnw5td
+          aws-region: us-east-1
+
+      - name: Install infra dependencies
+        run: npm ci
+        working-directory: infra
+
+      - name: CDK Bootstrap
+        run: npx cdk bootstrap
+        working-directory: infra
+
+      - name: CDK Deploy
+        run: npx cdk deploy --require-approval never
+        working-directory: infra
