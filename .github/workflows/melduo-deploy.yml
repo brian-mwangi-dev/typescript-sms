@@ -28,63 +28,76 @@ jobs:
           role-to-assume: arn:aws:iam::847460071934:role/MelduoOidc-cmrohlgz
           aws-region: us-east-1
 
-      # ── Node.js (app + CDK) ───────────────────────────────────────────────────
+      # ── Node.js ───────────────────────────────────────────────────────────────
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: "npm"
 
-      # ── CDK bootstrap + deploy ────────────────────────────────────────────────
+      # ── Install CDK dependencies ──────────────────────────────────────────────
       - name: Install CDK dependencies
         run: npm ci
         working-directory: infra
 
+      # ── CDK bootstrap ─────────────────────────────────────────────────────────
       - name: CDK bootstrap
         run: npx cdk bootstrap
         working-directory: infra
 
-      - name: CDK deploy
-        run: npx cdk deploy --require-approval never --outputs-file outputs.json
+      # ── Step 1: Deploy ECR stack only ────────────────────────────────────────
+      # This creates the ECR repository (and nothing else) so we have a place
+      # to push the Docker image before App Runner tries to pull it.
+      - name: CDK deploy – ECR repository
+        run: npx cdk deploy melduo-app-cmrohlgz-ecr --require-approval never --outputs-file outputs-ecr.json
         working-directory: infra
 
-      # ── Read ECR repo URI from CDK outputs ────────────────────────────────────
-      - name: Read CDK outputs
-        id: cdk-outputs
+      # ── Read ECR URI from ECR stack output ────────────────────────────────────
+      - name: Get ECR repository URI
+        id: ecr-info
         run: |
-          ECR_URI=$(node -e "const o=require('./infra/outputs.json'); console.log(o['melduo-app-cmrohlgz']['EcrRepositoryUri'])")
-          SERVICE_URL=$(node -e "const o=require('./infra/outputs.json'); console.log(o['melduo-app-cmrohlgz']['AppUrl'])")
+          ECR_URI=$(node -e "const o=require('./infra/outputs-ecr.json'); console.log(o['melduo-app-cmrohlgz-ecr']['EcrRepositoryUri'])")
           echo "ecr_uri=$ECR_URI" >> "$GITHUB_OUTPUT"
-          echo "service_url=$SERVICE_URL" >> "$GITHUB_OUTPUT"
+          echo "ECR URI: $ECR_URI"
 
-      # ── Build & push Docker image ─────────────────────────────────────────────
+      # ── Step 2: Build & push Docker image ────────────────────────────────────
+      # Image must exist in ECR before App Runner service is created/updated.
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build Docker image
-        run: docker build -t ${{ steps.cdk-outputs.outputs.ecr_uri }}:latest .
+        run: docker build -t ${{ steps.ecr-info.outputs.ecr_uri }}:latest .
 
       - name: Push Docker image to ECR
-        run: docker push ${{ steps.cdk-outputs.outputs.ecr_uri }}:latest
+        run: docker push ${{ steps.ecr-info.outputs.ecr_uri }}:latest
 
-      # ── Trigger App Runner to deploy the new image ────────────────────────────
-      - name: Update App Runner service
+      # ── Step 3: Deploy App Runner stack ──────────────────────────────────────
+      # Now that the image exists in ECR, App Runner can pull it successfully.
+      - name: CDK deploy – App Runner service
+        run: npx cdk deploy melduo-app-cmrohlgz --require-approval never --outputs-file outputs.json
+        working-directory: infra
+
+      # ── Read App Runner outputs ────────────────────────────────────────────────
+      - name: Read CDK outputs
+        id: cdk-outputs
+        run: |
+          SERVICE_URL=$(node -e "const o=require('./infra/outputs.json'); console.log(o['melduo-app-cmrohlgz']['AppUrl'])")
+          echo "service_url=$SERVICE_URL" >> "$GITHUB_OUTPUT"
+
+      # ── Trigger fresh deployment on re-deploys ────────────────────────────────
+      # On the very first deploy CDK handles it; on subsequent runs we trigger
+      # a new deployment so App Runner picks up the freshly-pushed image.
+      - name: Trigger App Runner deployment
         run: |
           SERVICE_ARN=$(aws apprunner list-services \
-            --query "ServiceSummaryList[?ServiceName=='melduo-app-cmrohlgz-AppRunnerService'][0].ServiceArn" \
+            --query "ServiceSummaryList[?ServiceName=='melduo-app-cmrohlgz-AppRunnerService'].ServiceArn | [0]" \
             --output text 2>/dev/null || true)
-
-          if [ -z "$SERVICE_ARN" ] || [ "$SERVICE_ARN" = "None" ]; then
-            # Fallback: find by URL
-            APP_URL="${{ steps.cdk-outputs.outputs.service_url }}"
-            HOSTNAME="${APP_URL#https://}"
-            SERVICE_ARN=$(aws apprunner list-services \
-              --query "ServiceSummaryList[?contains(ServiceUrl, '${HOSTNAME}')].ServiceArn | [0]" \
-              --output text)
+          if [ -n "$SERVICE_ARN" ] && [ "$SERVICE_ARN" != "None" ] && [ "$SERVICE_ARN" != "null" ]; then
+            echo "Triggering App Runner deployment: $SERVICE_ARN"
+            aws apprunner start-deployment --service-arn "$SERVICE_ARN"
+          else
+            echo "Service not found by name; CDK deploy already handled first creation."
           fi
-
-          echo "Updating App Runner service: $SERVICE_ARN"
-          aws apprunner update-service --service-arn "$SERVICE_ARN"
 
       - name: Echo App URL
         run: echo "App is live at ${{ steps.cdk-outputs.outputs.service_url }}"

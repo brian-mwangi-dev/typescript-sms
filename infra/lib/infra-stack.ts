@@ -10,20 +10,16 @@ const SSM_PARAMS = {
   AFRICASTALKING_USERNAME: '/melduo/cmrohlgz/AFRICASTALKING_USERNAME',
 } as const;
 
+export interface MelduoAppStackProps extends cdk.StackProps {
+  /** ECR repository that holds the app image — must exist and have an image before this stack deploys */
+  repository: ecr.Repository;
+}
+
 export class MelduoAppStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props: MelduoAppStackProps) {
     super(scope, id, props);
 
-    // ── ECR repository ────────────────────────────────────────────────────────
-    const repo = new ecr.Repository(this, 'AppRepo', {
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-      lifecycleRules: [
-        {
-          maxImageCount: 5,
-          description: 'Keep last 5 images',
-        },
-      ],
-    });
+    const { repository } = props;
 
     // ── App Runner instance role (grants access to SSM SecureString params) ──
     const instanceRole = new iam.Role(this, 'AppRunnerInstanceRole', {
@@ -54,7 +50,9 @@ export class MelduoAppStack extends cdk.Stack {
       ],
     });
 
-    // ── App Runner service (L1 CfnService for SSM secret injection support) ──
+    // ── App Runner service ────────────────────────────────────────────────────
+    // Port 5000 matches the app's default (process.env.PORT || 5000).
+    // App Runner injects PORT=5000 into the container so the app binds correctly.
     const service = new apprunner.CfnService(this, 'AppRunnerService', {
       sourceConfiguration: {
         authenticationConfiguration: {
@@ -62,7 +60,7 @@ export class MelduoAppStack extends cdk.Stack {
         },
         autoDeploymentsEnabled: false,
         imageRepository: {
-          imageIdentifier: `${repo.repositoryUri}:latest`,
+          imageIdentifier: `${repository.repositoryUri}:latest`,
           imageRepositoryType: 'ECR',
           imageConfiguration: {
             port: '5000',
@@ -93,11 +91,6 @@ export class MelduoAppStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'AppUrl', {
       value: `https://${service.attrServiceUrl}`,
       description: 'App Runner service URL',
-    });
-
-    new cdk.CfnOutput(this, 'EcrRepositoryUri', {
-      value: repo.repositoryUri,
-      description: 'ECR repository URI for image pushes',
     });
   }
 }
